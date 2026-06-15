@@ -42,7 +42,7 @@ export default function App() {
       setRepoData(data);
     } catch (err: any) {
       console.error(err);
-      setError(err.message || "An unexpected issue occurred while mapping codebase telemetry");
+      setError(err.message || "An unexpected issue occurred while analyzing the repository");
     } finally {
       setIsLoading(false);
     }
@@ -114,7 +114,7 @@ export default function App() {
           >
             <AlertCircle className="w-5 h-5 text-rose-450 shrink-0 mt-0.5 animate-bounce" />
             <div className="font-sans">
-              <h4 className="text-sm font-semibold text-white">Telemetry Analysis Interrupted</h4>
+              <h4 className="text-sm font-semibold text-white">Analysis Interrupted</h4>
               <p className="text-xs text-slate-450 mt-1 leading-relaxed">
                 {error}
               </p>
