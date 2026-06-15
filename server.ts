@@ -12,15 +12,25 @@ app.use(express.json());
 
 const PORT = 3000;
 
-// Initialize GoogleGenAI client server-side
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      "User-Agent": "aistudio-build",
-    },
-  },
-});
+// Lazy initialize GoogleGenAI client server-side
+let aiClient: GoogleGenAI | null = null;
+function getAIInstance() {
+  if (!aiClient) {
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error("GEMINI_API_KEY environment variable is required but was not provided in the environment/settings.");
+    }
+    aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
+      },
+    });
+  }
+  return aiClient;
+}
 
 // Helper: Safely fetch from GitHub API with optional user token & User-Agent
 async function fetchFromGitHub(endpoint: string, userToken?: string) {
@@ -73,6 +83,52 @@ async function fetchReadmeContent(owner: string, repo: string, userToken?: strin
   return "No README file found or accessible for this repository.";
 }
 
+// Helper to generate content with fallback across different Gemini models
+async function generateContentWithFallback(ai: GoogleGenAI, params: any) {
+  const models = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"];
+  let lastError: any = null;
+
+  for (const model of models) {
+    try {
+      console.log(`[Gemini] Attempting content generation with model candidate: ${model}`);
+      const response = await ai.models.generateContent({
+        ...params,
+        model,
+      });
+      return response;
+    } catch (err: any) {
+      console.warn(`[Gemini] Candidate ${model} generation failed or encountered 503:`, err.message || err);
+      lastError = err;
+    }
+  }
+  throw lastError || new Error("All candidate models failed to generate content.");
+}
+
+// Helper to send chat message with fallback across different Gemini models
+async function sendChatMessageWithFallback(ai: GoogleGenAI, message: string, history: any[], systemInstruction: string) {
+  const models = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"];
+  let lastError: any = null;
+
+  for (const model of models) {
+    try {
+      console.log(`[Gemini Chat] Attempting chat message with model candidate: ${model}`);
+      const chat = ai.chats.create({
+        model,
+        history,
+        config: {
+          systemInstruction,
+        }
+      });
+      const response = await chat.sendMessage({ message });
+      return response;
+    } catch (err: any) {
+      console.warn(`[Gemini Chat] Candidate ${model} chat failed or encountered 503:`, err.message || err);
+      lastError = err;
+    }
+  }
+  throw lastError || new Error("All candidate models failed during chat session transaction.");
+}
+
 // API: Analyze repository metadata & README with Gemini API
 app.post("/api/analyze-repo", async (req, res) => {
   const { owner, repo, token } = req.body;
@@ -82,22 +138,50 @@ app.post("/api/analyze-repo", async (req, res) => {
   }
 
   try {
-    // 1. Fetch live metadata and language specifications
-    const repoInfoFuture = fetchFromGitHub(`repos/${owner}/${repo}`, token);
-    const languagesFuture = fetchFromGitHub(`repos/${owner}/${repo}/languages`, token);
-    const readmeContentFuture = fetchReadmeContent(owner, repo, token);
+    const ai = getAIInstance();
 
-    const [repoInfo, languages, readme] = await Promise.all([
-      repoInfoFuture,
-      languagesFuture,
-      readmeContentFuture,
-    ]);
+    // 1. Fetch live metadata and language specifications with individual error boundary wrappers
+    let repoInfo: any = null;
+    try {
+      repoInfo = await fetchFromGitHub(`repos/${owner}/${repo}`, token);
+    } catch (err: any) {
+      console.warn("[GitHub API] Failed to fetch repository root info:", err.message);
+      repoInfo = {
+        name: repo,
+        full_name: `${owner}/${repo}`,
+        description: `Source repository for ${owner}/${repo}`,
+        stargazers_count: 0,
+        forks_count: 0,
+        watchers_count: 0,
+        open_issues_count: 0,
+        owner: { avatar_url: "https://github.githubassets.com/images/modules/logos_page/GitHub-Mark.png" },
+        homepage: "",
+        license: null,
+        updated_at: new Date().toISOString(),
+        default_branch: "main"
+      };
+    }
+
+    let languages = {};
+    try {
+      languages = await fetchFromGitHub(`repos/${owner}/${repo}/languages`, token);
+    } catch (err: any) {
+      console.warn("[GitHub API] Failed to fetch languages:", err.message);
+    }
+
+    let readme = "";
+    try {
+      readme = await fetchReadmeContent(owner, repo, token);
+    } catch (err: any) {
+      console.warn("[GitHub API] Failed to fetch readme content:", err.message);
+      readme = "No README file found or accessible for this repository.";
+    }
 
     // Truncate README content to prevent context overflow, while preserving significant content
     const maxReadmeLength = 15000;
-    const truncatedReadme = readme.length > maxReadmeLength 
+    const truncatedReadme = (readme || "").length > maxReadmeLength 
       ? readme.substring(0, maxReadmeLength) + "\n\n...[README truncated for length]..."
-      : readme;
+      : (readme || "No README file available.");
 
     // Create the analytical prompt for Gemini
     const analysisPrompt = `
@@ -120,9 +204,8 @@ app.post("/api/analyze-repo", async (req, res) => {
       Generate a highly-detailed, accurate analysis. Do not include mock values. Adhere to the requested JSON response schema structure.
     `;
 
-    // Leverage Gemini-3.5-flash for structured analysis
-    const geminiResponse = await ai.models.generateContent({
-      model: "gemini-3.5-flash",
+    // Leverage Gemini-3.5-flash with robust model fallbacks for structured analysis
+    const geminiResponse = await generateContentWithFallback(ai, {
       contents: analysisPrompt,
       config: {
         systemInstruction: "You are a professional software analyst. Provide deep, accurate insights. Do not hallucinate. Format your output strictly using the requested JSON schema.",
@@ -210,6 +293,8 @@ app.post("/api/chat-repo", async (req, res) => {
   }
 
   try {
+    const ai = getAIInstance();
+
     // Scaffold system context containing everything about this repository
     const systemContext = `
       You are an expert developer assistant responding to queries about the repository: ${owner}/${repo}.
@@ -231,15 +316,13 @@ app.post("/api/chat-repo", async (req, res) => {
         }))
       : [];
 
-    const chat = ai.chats.create({
-      model: "gemini-3.5-flash",
-      history: chatHistory,
-      config: {
-        systemInstruction: systemContext,
-      }
-    });
+    const response = await sendChatMessageWithFallback(
+      ai,
+      message,
+      chatHistory,
+      systemContext
+    );
 
-    const response = await chat.sendMessage({ message });
     res.json({ reply: response.text });
   } catch (error: any) {
     console.error("Chat API error:", error);
